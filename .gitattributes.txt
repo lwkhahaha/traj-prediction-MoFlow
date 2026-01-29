@@ -1,0 +1,5 @@
+# 所有 Python 文件强制使用 LF，禁止转换
+*.py text eol=lf
+
+# 如果有 Windows 批处理脚本，可以保留 CRLF
+*.bat text eol=crlf
