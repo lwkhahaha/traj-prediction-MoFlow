@@ -310,6 +310,7 @@ class EncoderLayer(nn.Module):
 class EncoderLayerV2(EncoderLayer):
     def forward(self, x):
         # 仅使用正向 Mamba 操作
+        
         new_x = self.mamba(x)  # 移除了反向分支
         
         x = x + new_x

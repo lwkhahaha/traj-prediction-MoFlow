@@ -4,6 +4,7 @@
 # All Rights Reserved
 
 
+import numpy as np
 import torch
 import torch.nn as nn
 from ..utils import common_layers
@@ -121,12 +122,18 @@ class MoELayer(nn.Module):
     def __init__(self, mid_feature, num_kpt):
         super().__init__()
         self.expert_pool = FourExpertsPool_Shared(
-            mid_feature=75,
+            mid_feature=mid_feature,
             num_kpt=num_kpt,
             depth=3,
             num_experts=4
         )
         self.top_k = 1
+        # self.gate = ExpertGating(
+        #     input_dim=mid_feature,
+        #     num_experts=4,
+        #     top_k = 1
+        # )
+
         self.gate = ExpertGating(
             input_dim=mid_feature,
             num_experts=4,
@@ -177,10 +184,11 @@ class MoELayer(nn.Module):
         return moe_out
 
 class PointNetPolylineEncoder(nn.Module):
-    def __init__(self, in_channels, hidden_dim, num_layers=3, num_pre_layers=2, out_channels=None, num_kpt=3):
+    def __init__(self, in_channels, hidden_dim, num_layers=3, num_pre_layers=2, out_channels=None, num_kpt=3, mid_feature = 10):
         super().__init__()
+        self.num_kpt = num_kpt
         self.dct, self.idct = self.get_dct_matrix(self.num_kpt*2)
-        self.mid_feature
+        self.mid_feature = mid_feature
         self.pre_mlps = common_layers.build_mlps(
             c_in=in_channels,
             mlp_channels=[hidden_dim] * num_pre_layers,
@@ -263,3 +271,18 @@ class PointNetPolylineEncoder(nn.Module):
             feature_buffers = feature_buffers.new_zeros(batch_size, num_polylines, feature_buffers_valid.shape[-1])
             feature_buffers[valid_mask] = feature_buffers_valid
         return feature_buffers
+    
+    def get_dct_matrix(self, N):
+        # Computes the discrete cosine transform (DCT) matrix and its inverse (IDCT)
+        dct_m = np.eye(N)
+        for k in np.arange(N):
+            for i in np.arange(N):
+                w = np.sqrt(2 / N)
+                if k == 0:
+                    w = np.sqrt(1 / N)
+                dct_m[k, i] = w * np.cos(np.pi * (i + 1 / 2) * k / N)
+        idct_m = np.linalg.inv(dct_m)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dct_m = torch.tensor(dct_m).float().to(device)
+        idct_m = torch.tensor(idct_m).float().to(device)
+        return dct_m, idct_m
