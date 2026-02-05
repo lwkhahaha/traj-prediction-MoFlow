@@ -31,13 +31,13 @@ class SharedMambaBlocks(nn.Module):
                 EncoderLayer(
                     Mamba(
                         d_model=d_model,
-                        d_state=32,
+                        d_state=16,
                         d_conv=2,
                         expand=1
                     ),
                     Mamba(
                         d_model=d_model,
-                        d_state=32,
+                        d_state=16,
                         d_conv=2,
                         expand=1
                     ),
@@ -50,7 +50,7 @@ class SharedMambaBlocks(nn.Module):
         )
 
 class FourExpertsPool_Shared(SharedMambaBlocks):
-    def __init__(self, mid_feature, num_kpt, depth=1, num_experts=4):
+    def __init__(self, mid_feature, num_kpt, depth=1, num_experts=2):
         super().__init__(mid_feature, num_kpt, depth)
         
         # 初始化专家模块（共享核心参数）
@@ -74,17 +74,30 @@ class FourExpertsPool_Shared(SharedMambaBlocks):
             spatial_mamba2=self.shared_spatial
         )
 
-        self.experts = nn.ModuleList([
-            self.ts_expert, self.st_expert,
-            self.ss_expert, self.tt_expert
-        ])
+        all_experts = [self.ts_expert, self.st_expert, self.ss_expert, self.tt_expert]
+        self.experts = nn.ModuleList(all_experts[:num_experts])
 
-    def forward(self, x):
-        expert_outputs = [expert(x) for expert in self.experts]
-        return torch.stack(expert_outputs, dim=1)
+    def forward(self, x, indices=None):
+        # x: [B, J3, T]
+        if indices is None:
+            expert_outputs = [expert(x) for expert in self.experts]
+            return torch.stack(expert_outputs, dim=1)  # [B, E, J3, T]
+
+        # Top-1 sparse compute
+        assert indices.dim() == 2 and indices.size(1) == 1
+        idx = indices.squeeze(1)  # [B]
+        B, J3, T = x.shape
+        out = x.new_zeros(B, J3, T)
+
+        for e, expert in enumerate(self.experts):
+            mask = (idx == e)
+            if mask.any():
+                out[mask] = expert(x[mask])
+
+        return out  # [B, J3, T]
     
 class ExpertGating(nn.Module):
-    def __init__(self, input_dim, num_experts=4, top_k=2):
+    def __init__(self, input_dim, num_experts=2, top_k=2):
         super().__init__()
         self.top_k = top_k
         
@@ -119,25 +132,19 @@ class ExpertGating(nn.Module):
         return sparse_weights, indices
 
 class MoELayer(nn.Module):
-    def __init__(self, mid_feature, num_kpt):
+    def __init__(self, mid_feature, num_kpt, num_experts=2, top_k=1):
         super().__init__()
         self.expert_pool = FourExpertsPool_Shared(
             mid_feature=mid_feature,
             num_kpt=num_kpt,
-            depth=3,
-            num_experts=4
+            depth=1,
+            num_experts=num_experts
         )
-        self.top_k = 1
-        # self.gate = ExpertGating(
-        #     input_dim=mid_feature,
-        #     num_experts=4,
-        #     top_k = 1
-        # )
-
+        self.top_k = top_k
         self.gate = ExpertGating(
             input_dim=mid_feature,
-            num_experts=4,
-            top_k=1
+            num_experts=num_experts,
+            top_k=self.top_k
         )
         # 添加标记用于捕获专家输出
         self.capture_expert_output = False
@@ -152,7 +159,6 @@ class MoELayer(nn.Module):
          # 标准化
         # x = self.norm(x)
         # 获取所有专家输出
-        expert_outputs = self.expert_pool(x)  # [B, 4, J3, T]
 
         # 如果设置了捕获标记，保存专家输出
         if self.capture_expert_output:
@@ -167,20 +173,11 @@ class MoELayer(nn.Module):
             
         # 获取门控权重
         gate_weights, indices = self.gate(x)  # [B, 4], [B, 2]
-        
-         # 动态选择专家
-        selected_experts = torch.gather(
-            expert_outputs,
-            dim=1,
-            index=indices.view(B, self.top_k, 1, 1).expand(-1, -1, J3, T)
-        )  # [B, 2, J3, T]
-        
-        # 加权融合
-        weights = gate_weights.gather(1, indices).view(B, self.top_k, 1, 1)  # [B, 2, 1, 1]
-        moe_out = (selected_experts * weights).sum(dim=1)  # [B, J3, T]
-        
-        # 残差连接
-        # return moe_out + self.res_coef * residual
+        assert indices.shape[1] == self.top_k ==1
+
+        moe_out = self.expert_pool(x, indices=indices)  # 只算选中的 expert，直接 [B,J3,T]
+        w = gate_weights.gather(1, indices).view(B, 1, 1)  # [B,1,1]
+        moe_out = moe_out * w
         return moe_out
 
 class PointNetPolylineEncoder(nn.Module):
@@ -204,6 +201,8 @@ class PointNetPolylineEncoder(nn.Module):
             MoELayer(
                 mid_feature=self.mid_feature,
                 num_kpt=num_kpt,
+                num_experts=2,
+                top_k=1
             ) for _ in range(1)
         ])
         
@@ -228,24 +227,23 @@ class PointNetPolylineEncoder(nn.Module):
 
         batch_size, num_polylines,  num_points_each_polylines, C = polylines.shape
 
-        for i in range(num_polylines):
+        B, A, Cc, Tp = input.shape   # input: [B, A, C, Tp]，这里 Cc 就是你原来的 C(=J3)
 
-            people_feature = input[:, i, :, :] # [B, C, Tp]
-            
-            filter_feature = people_feature.clone() # [B, C, Tp]
-            
-            # 通过MoE层处理
-            for moe_layer in self.moe_layers:
-                filter_feature = moe_layer(filter_feature)  # [B, C, Tp]
+        # 1) 把 A 合并进 batch： [B, A, C, Tp] -> [B*A, C, Tp]
+        people_feature = input.reshape(B * A, Cc, Tp)
 
-            feature = filter_feature + people_feature.clone() # [B, C, Tp]
-            feature = torch.matmul(self.idct, feature) # [B, C, Tp]
-            feature = feature.transpose(1, 2) # [B, Tp, C]
+        # 2) 过 MoE（一次性处理所有人）
+        filter_feature = people_feature
+        for moe_layer in self.moe_layers:
+            filter_feature = moe_layer(filter_feature)  # 仍然是 [B*A, C, Tp]
 
-            if i == 0:
-                polylines_pre = feature.unsqueeze(1).clone()
-            else:
-                polylines_pre = torch.cat([polylines_pre, feature.unsqueeze(1).clone()], 1) # [B, A, Tp, C]
+        # 3) 残差 + IDCT + 转回 [Tp, C]
+        feature = filter_feature + people_feature                 # [B*A, C, Tp]
+        feature = torch.matmul(self.idct, feature)                # [B*A, C, Tp]
+        feature = feature.transpose(1, 2).contiguous()            # [B*A, Tp, C]
+
+        # 4) reshape 回来： [B*A, Tp, C] -> [B, A, Tp, C]
+        polylines_pre = feature.view(B, A, Tp, Cc)
 
         # pre-mlp
         polylines_feature_valid = self.pre_mlps(polylines_pre[polylines_mask])  # (N, C)

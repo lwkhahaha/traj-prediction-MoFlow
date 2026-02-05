@@ -5,34 +5,46 @@ from models.utils.layers.Mamba import Mamba
 from models.utils.layers.Mamba import Encoder,EncoderLayer,EncoderLayerV2
 
 class STTemporalSpatialModule(nn.Module):
-    def __init__(self, spatial_mamba, temporal_mamba):
+    def __init__(self, spatial_mamba=None, temporal_mamba=None, seq_len=10, dropout=0.0):
         """
-        初始化 ST 分支模块。
+        Linear 版 ST 分支模块（可直接替换原 STTemporalSpatialModule）。
+
+        说明：
+        - 不再使用 spatial_mamba / temporal_mamba（为了兼容旧调用签名仍保留参数）
+        - 输入/输出都为 [b, J3, seq_len]
+        - 在时间维 seq_len 上做两层 Linear（相当于轻量 temporal mixing）
 
         Args:
-            spatial_mamba (nn.Module): 空间维度的 Mamba 模块。
-            temporal_mamba (nn.Module): 时间维度的 Mamba 模块。
+            spatial_mamba (nn.Module, optional): 为兼容保留，不使用
+            temporal_mamba (nn.Module, optional): 为兼容保留，不使用
+            seq_len (int): 序列长度（你的 Tp / past_frames / num_kpt? 对应的时间长度），例如 10
+            dropout (float): 可选 dropout
         """
         super(STTemporalSpatialModule, self).__init__()
-        self.spatial_mamba = spatial_mamba
-        self.temporal_mamba = temporal_mamba
+        self.seq_len = seq_len
+
+        self.temporal_mlp = nn.Sequential(
+            nn.Linear(seq_len, seq_len),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(seq_len, seq_len),
+        )
 
     def forward(self, filter_feature):
         """
-        前向传播方法。
-
         Args:
-            filter_feature (torch.Tensor): 输入特征，形状为 [b, J3, seq_len]。
+            filter_feature: [b, J3, seq_len]
 
         Returns:
-            torch.Tensor: 处理后的特征，形状为 [b, seq_len, J3]。
+            out: [b, J3, seq_len]
         """
-        # [b, J3, seq_len] -> [b, J3, seq_len]
-        spatial_feature_att, attns = self.spatial_mamba(filter_feature)
-        # [b, seq_len, J3] -> [b, seq_len, J3]->[b, J3, seq_len]
-        spatial_temporal_feature_att, attns = self.temporal_mamba(spatial_feature_att.transpose(1, 2))
-        spatial_temporal_feature_att = spatial_temporal_feature_att.transpose(1, 2)
-        return spatial_temporal_feature_att
+        b, j3, t = filter_feature.shape
+        if t != self.seq_len:
+            raise ValueError(f"STTemporalSpatialModule (Linear) expected seq_len={self.seq_len}, but got t={t}")
+
+        # 对每个通道的时间序列做线性混合
+        out = self.temporal_mlp(filter_feature)  # Linear 默认作用在最后一维 seq_len
+        return out
 
 class TSTemporalSpatialModule(nn.Module):
     def __init__(self, temporal_mamba, spatial_mamba):
