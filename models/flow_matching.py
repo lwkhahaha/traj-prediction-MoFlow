@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,127 @@ def pad_t_like_x(t, x):
         return t
     return t.reshape(-1, *([1] * (x.dim() - 1)))
 
+def _make_1d_freq_mask_rfft(T: int, device, dtype,
+                           cutoff: float = 0.25,
+                           kind: str = "gaussian",
+                           order: int = 4):
+    """
+    生成 rFFT 频率域的低通 mask M,长度为 T//2+1, 值域 [0,1]
+    cutoff: 相对截止频率(0~0.5)，越小越偏低频
+    kind: 'gaussian' or 'butterworth'
+    """
+    # rfft 频率（cycles/sample），范围 [0, 0.5]
+    f = torch.fft.rfftfreq(T, d=1.0, device=device)  # [T//2+1], in [0, 0.5]
+    fc = max(1e-6, float(cutoff))
+
+    if kind == "gaussian":
+        # exp(-0.5*(f/fc)^2)
+        M = torch.exp(-0.5 * (f / fc) ** 2)
+    elif kind == "butterworth":
+        # 1 / sqrt(1 + (f/fc)^(2n))  -> 值域[0,1]
+        # （注意这里用 sqrt 形式，让能量衰减更平滑；也可用你贴的 1/(1+(...)^n)）
+        M = 1.0 / torch.sqrt(1.0 + (f / fc) ** (2 * order))
+    else:
+        raise ValueError(f"kind must be gaussian/butterworth, got {kind}")
+
+    return M.to(dtype=dtype)  # [T//2+1]
+
+
+def tied_lowfreq_indep_highfreq_noise(x: torch.Tensor,
+                                      time_dim: int = -2,
+                                      cutoff: float = 0.25,
+                                      kind: str = "gaussian",
+                                      order: int = 4,
+                                      share_dim: int = 1):
+    """
+    对形状类似 [B, K, T, D] 的张量 x,生成噪声:
+    - 低频来自共享噪声(K 维共享)
+    - 高频来自独立噪声(K 维独立)
+    并在 time_dim (T 维) 上做频域混合。
+
+    share_dim: 需要共享的维度(通常 K=1 这个维度;x 是 [B,K,T,D] 时 share_dim=1)
+    """
+    assert x.ndim >= 3, "x should have at least [..., T, D]-like dims"
+    device, dtype = x.device, x.dtype
+    T = x.shape[time_dim]
+
+    # 1) 共享噪声 u_shared：在 share_dim 上只采 1 份再 expand
+    shape_shared = list(x.shape)
+    shape_shared[share_dim] = 1
+    u = torch.randn(shape_shared, device=device, dtype=dtype)
+    u = u.expand_as(x)  # 共享到所有 head
+
+    # 2) 独立噪声 v_indep：每个 head 各自一份
+    v = torch.randn_like(x)
+
+    # 3) rFFT on time_dim
+    U = torch.fft.rfft(u, dim=time_dim)  # complex
+    V = torch.fft.rfft(v, dim=time_dim)  # complex
+
+    # 4) 构造低通 mask M(f)，并 broadcast 到 U/V 的维度
+    M = _make_1d_freq_mask_rfft(T, device=device, dtype=U.real.dtype,
+                                cutoff=cutoff, kind=kind, order=order)  # [T//2+1]
+    # reshape 为可 broadcast：在 time_dim 位置放 -1，其余为 1
+    # 注意 rfft 后 time_dim 长度变为 T//2+1
+    view_shape = [1] * U.ndim
+    view_shape[time_dim] = -1
+    M = M.view(*view_shape)  # [..., T//2+1, ...]
+
+    # 5) 关键：用 M 和 sqrt(1-M^2) 混合，保持（尽量）高斯性质
+    M2 = M * M
+    mix = torch.sqrt(torch.clamp(1.0 - M2, min=0.0))
+    Z = M * U + mix * V
+
+    # 6) 回到时域
+    z = torch.fft.irfft(Z, n=T, dim=time_dim)
+
+    return z
+
+def noise_lf_tied_hf_indep_BKAFD(
+    x_shape_like: torch.Tensor,
+    future_frames: int,
+    coord_dim: int = 2,
+    cutoff: float = 0.25,
+    kind: str = "gaussian",
+    order: int = 4,
+):
+    """
+    生成噪声，输出 shape 与 x_shape_like 相同: [B,K,A,F*D]
+    - 低频: K 维共享
+    - 高频: K 维独立
+    在 F 维（时间）做频域混合
+    """
+    assert x_shape_like.ndim == 4, "expect [B,K,A,F*D]"
+    B, K, A, FD = x_shape_like.shape
+    F, D = future_frames, coord_dim
+    assert FD == F * D, f"out_dim mismatch: got {FD}, expect {F}*{D}={F*D}"
+
+    device, dtype = x_shape_like.device, x_shape_like.dtype
+
+    # 1) 共享低频用的噪声 u: [B,1,A,F,D] -> expand 到 K
+    u = torch.randn((B, 1, A, F, D), device=device, dtype=dtype).expand(B, K, A, F, D)
+
+    # 2) 独立高频用的噪声 v: [B,K,A,F,D]
+    v = torch.randn((B, K, A, F, D), device=device, dtype=dtype)
+
+    # 3) rFFT on time dim (F 维: dim=3)
+    U = torch.fft.rfft(u, dim=3)
+    V = torch.fft.rfft(v, dim=3)
+
+    # 4) mask M: [F//2+1] -> broadcast to [B,K,A,Fq,D]
+    M = _make_1d_freq_mask_rfft(F, device=device, dtype=U.real.dtype,
+                                cutoff=cutoff, kind=kind, order=order)  # [Fq]
+    M = M.view(1, 1, 1, -1, 1)  # broadcast
+
+    # 5) 关键混合：M 和 sqrt(1-M^2)（保持方差/近似高斯）
+    mix = torch.sqrt(torch.clamp(1.0 - M * M, min=0.0))
+    Z = M * U + mix * V
+
+    # 6) 回时域 -> [B,K,A,F,D] -> flatten to [B,K,A,F*D]
+    z = torch.fft.irfft(Z, n=F, dim=3)
+    return z.reshape(B, K, A, FD)
+
+
 
 class FlowMatcher(nn.Module):
     def __init__(
@@ -54,6 +176,7 @@ class FlowMatcher(nn.Module):
         super().__init__()
 
         # init
+        self.tied_lowfreq_indep_highfreq = True
         self.cfg = cfg
         self.model = model
         self.logger = logger
@@ -197,11 +320,19 @@ class FlowMatcher(nn.Module):
         assert t.min() >= 0 and t.max() <= 1
 
         # noise sample
-        if self.cfg.tied_noise:
-            noise = torch.randn_like(y_start_k[:, 0:1])                                  # [B, 1, T, D]
-            noise = noise.expand(-1, self.cfg.denoising_head_preds, -1, -1)              # [B, K, T, D]
+        if self.tied_lowfreq_indep_highfreq == False:
+            noise = noise_lf_tied_hf_indep_BKAFD(
+                y_start_k,
+                future_frames=self.cfg.future_frames,   # 你的未来帧数 F
+                coord_dim=2,
+                cutoff=0.25,
+                kind="gaussian",
+                order=4
+            )
+        elif self.cfg.tied_noise:
+            noise = torch.randn_like(y_start_k[:, 0:1]).expand(-1, self.cfg.denoising_head_preds, -1, -1)
         else:
-            noise = torch.randn_like(y_start_k)                                          # [B, K, T, D]
+            noise = torch.randn_like(y_start_k)
 
         # sample the latent space at time t
         x_t, u_t = self.fwd_sample_t(x0=noise, x1=y_start_k, t=t)                        # [B, K, T, D] * 2
@@ -283,7 +414,17 @@ class FlowMatcher(nn.Module):
 
         batch_size = x_data['batch_size']
         y_t = torch.randn((batch_size, num_trajs, self.num_agents, self.out_dim), device=self.device)
-        if self.cfg.tied_noise:
+
+        if tied_lowfreq_indep_highfreq == False:
+            y_t = noise_lf_tied_hf_indep_BKAFD(
+                y_t,
+                future_frames=self.cfg.future_frames,
+                coord_dim=2,
+                cutoff=0.25,
+                kind="gaussian",
+                order=4
+            )
+        elif self.cfg.tied_noise:
             y_t = y_t[:, :1].expand(-1, self.cfg.denoising_head_preds, -1, -1)
 
         # sampling loop
