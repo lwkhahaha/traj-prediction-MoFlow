@@ -173,6 +173,7 @@ class IMLETransformer(nn.Module):
         self.model_cfg = model_config
         self.dim = self.model_cfg.CONTEXT_ENCODER.D_MODEL
         self.cfg = config
+        self.tied_lowfreq_indep_highfreq = False
 
         self.objective = self.cfg.objective
 
@@ -241,8 +242,20 @@ class IMLETransformer(nn.Module):
         encoder_out = self.context_encoder(x_data['past_traj_original_scale'])  # [B, A, D]
 
         # init noise embeddings
-        noise = torch.randn((B, M, D), device=device)       # [B, M, D]
-        noise_emb = self.noisy_vec_mlp(noise)  	            # [B, M, D]
+        if self.tied_lowfreq_indep_highfreq == False:
+            # 对学生：在 embedding 维 D (dim=-1) 做 FFT；共享维度是 M (dim=1)
+            noise = lf_tied_hf_indep_fft(
+                x_like=torch.empty((B, M, D), device=device, dtype=torch.float32),
+                fft_dim=-1,
+                share_dim=1,
+                cutoff=0.25,
+                kind="gaussian",
+                order4
+            )
+        else:
+            noise = torch.randn((B, M, D), device=device)
+
+        noise_emb = self.noisy_vec_mlp(noise)
 
 
         if self.cfg.objective == 'set':
